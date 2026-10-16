@@ -14,7 +14,6 @@ Standalone sidebar quota widget for [DeepSeek Harness (dsh)](https://github.com/
 ## 依赖
 
 - **dsh-tap** 必须已安装并配置在同一 profile 中（本插件读取 dsh-tap 的 `/dsh-tap/settings` HTTP 路由获取余量数据）
-- dsh ≥ 0.1.6（需要 `sidebar.footer.action` 槽位支持）
 
 ## 安装
 
@@ -52,18 +51,19 @@ pnpm add dsh-tap-quota
 
 ## 显示内容
 
-在左侧菜单底部（Settings 按钮旁）显示一个紧凑的多行组件：
+在左侧菜单底部（会话列表与 Settings 按钮之间）显示一个**占满侧栏全宽**的紧凑 2×2 网格组件：
 
 ```
-● CB     12.3K 剩余 / 50.0K
-  ▓▓▓▓▓▓▓▓▓░░░░░░░░░░░  (周期用量进度条)
-● Trae   8.5K IDE / 3.2K Work
-  ▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░
-● Qoder  450 / 1000
-  ▓▓▓▓▓▓▓▓░░░░░░░░░░░░
-─────────────────────
-累计消耗: 1.2K credits / 34 次请求
-↻ 刷新
+● CodeBuddy   ● Trae
+  12.3K 剩余    4.1K IDE
+  周期 50.0K    0.0 Work
+  ▓▓▓▓▓▓░░░░   ▓░░░░░░░░░
+● Qoder       ● 消耗
+  0.0 cr...     1.3K c...
+  总量 300.0    316 次请...
+  ░░░░░░░░░░
+─────────────────────────
+22:11 更新            ↻ 刷新
 ```
 
 色点含义：
@@ -71,6 +71,18 @@ pnpm add dsh-tap-quota
 - 🟡 黄色：余量偏低（10%–30%）
 - 🔴 红色：余量危急（<10%）或获取失败
 - ⚪ 灰色：未登录或无数据
+
+## 实现说明：为什么不用 `sidebar.footer.action` 槽
+
+该槽是 **list 类型**，宿主把它渲染在一个 `display:flex` 的**行**容器里，而 `dsh-mobile` 插件的「移动访问」按钮注册在**同一行**。两个条目共享一行 flex 空间，余量组件会被压窄到右半侧、内容显示不全——此时无论给组件加多少 `flex:1` / `width:100%` 都无法占满。
+
+因此本插件改为**直接 DOM 注入**：把组件作为块级元素插到侧栏脚部容器（`footArea`，即承载「移动访问」按钮行 + Settings 按钮行的那个 flex column）**之前**，从而独占一行、占满侧栏内容宽度。
+
+实现细节：
+- 侧栏根元素通过 class 后缀匹配定位（CSS module 的 class 是 hash 的，如 `_2H3hWW_root`），与 dsh-mobile 的做法一致：找含 `_footArea` 与 `_regionArea` 子节点的 `_root` 元素
+- 侧栏折叠为 56px 窄轨时自动隐藏（放不下 2 栏网格）
+- `MutationObserver` 处理侧栏重挂载与折叠/展开切换
+- 插件卸载时（`ctx.effect` 的 disposer）清理 observer、定时器与 DOM 节点
 
 ## 开发
 
@@ -80,7 +92,7 @@ node --check lib/client.js
 node --check index.js
 ```
 
-无构建步骤：纯 `React.createElement`，与 dsh-tap 的客户端模块同款模块加载器模式。
+无构建步骤：纯 DOM API 构建（不依赖 `react-dom`，模块加载器的 require 表未暴露它），与 dsh-tap 的客户端模块同款模块加载器模式。
 
 ## License
 
