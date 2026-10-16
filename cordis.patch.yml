@@ -1,0 +1,13 @@
+# dsh-tap-quota — standalone sidebar quota widget
+#
+# Inserts this package into the profile's plugin entry list so cordis loads
+# index.js, which in turn makes the client module (lib/client.js) available
+# to the dsh web module loader. The client module registers a QuotaWidget
+# component in the sidebar.footer.action slot.
+#
+# Dependency: dsh-tap must also be installed in the same profile — this
+# plugin reads quota data from dsh-tap's /dsh-tap/settings HTTP route.
+
+- insert:
+    - id: dsh-tap-quota
+      name: 'dsh-tap-quota'

@@ -1,0 +1,43 @@
+{
+  "name": "dsh-tap-quota",
+  "version": "0.1.0",
+  "description": "Standalone sidebar quota widget for DeepSeek Harness (dsh): displays CodeBuddy / TraeWork CN / Qoder CN account balances and consumed credits in the left sidebar footer. Reads data from the dsh-tap plugin's /dsh-tap/settings route.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "codebuddy",
+    "trae",
+    "qoder",
+    "quota",
+    "balance"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@deepseek-ai/schemastery": "3.18.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  }
+}
