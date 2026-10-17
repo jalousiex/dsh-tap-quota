@@ -1,98 +1,80 @@
 # dsh-tap-quota
 
-Standalone sidebar quota widget for [DeepSeek Harness (dsh)](https://github.com/taikaikaikai-pixel/dsh-tap): displays CodeBuddy / TraeWork CN / Qoder CN account balances and consumed credits in the left sidebar footer.
+Sidebar quota card for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai): a compact
+**2-row** block showing the fixed `总消耗` plus up to three account channels
+(CodeBuddy / TraeWork CN / Qoder CN) — remaining amount, unit and a 2px progress bar.
 
-## Features
+## Design: one route, adapters, no hard plugin dependency
 
-- **三通道余量一览**：CodeBuddy（OAuth 额度 / API Key 估算）、TraeWork CN（IDE 池 + Work 池双池余额）、Qoder CN（用户配额 + 附加配额）
-- **已消耗积分**：从 dsh-tap 的 usage meter 读取累计消耗 credits 与请求次数
-- **状态色点 + 迷你进度条**：绿（充足）/ 黄（<30%）/ 红（<10%）/ 灰（未登录或无数据）
-- **自动刷新**：每 60 秒轮询一次，支持手动刷新
-- **深色主题**：使用宿主 `--dsw-alias-*` 设计令牌，自动跟随深色模式
-- **零侵入**：纯展示插件，不修改任何通道配置或凭据
+The browser makes **one** request per poll to `/dsh-tap-quota/snapshot`; the host half fans
+out and normalizes. It used to fire three POSTs straight at dsh-tap's private route with no
+backoff — a failing or absent dsh-tap left the card blank and every poll burned a connection.
 
-## 依赖
+Sources are probed at runtime, per channel:
 
-- **dsh-tap** 必须已安装并配置在同一 profile 中（本插件读取 dsh-tap 的 `/dsh-tap/settings` HTTP 路由获取余量数据）
-
-## 安装
-
-### 方式一：plugin_manager 安装（推荐）
-
-```bash
-# 在 dsh profile 目录下安装
-cd ~/.dsh/profiles/desktop
-pnpm add dsh-tap-quota
-```
-
-然后在 dsh 的插件管理器中启用 `dsh-tap-quota`。
-
-### 方式二：手动安装
-
-将本包放入 profile 的 `node_modules` 目录，然后在 `cordis.patch.yml` 中添加：
-
-```yaml
-- insert:
-    - id: dsh-tap-quota
-      name: 'dsh-tap-quota'
-```
-
-## 数据来源
-
-本插件不自行获取余量数据，而是复用 dsh-tap 插件的后端路由：
-
-| 动作 | 端点 | 返回 |
+| adapter | reads | used when |
 | --- | --- | --- |
-| `usage` | POST /dsh-tap/settings | CodeBuddy 额度快照 + usage meter 消耗统计 |
-| `trae-quota` | POST /dsh-tap/settings | TraeWork CN 双池余额（IDE / Work） |
-| `qoder-quota` | POST /dsh-tap/settings | Qoder CN 用户配额 + 附加配额 |
+| `tap-route` | `POST /dsh-tap/settings` actions `usage` / `trae-quota` / `qoder-quota` | preferred (reuses dsh-tap's upstream dialects + usage meter) |
+| `tap-files` | `~/.dsh/codebuddy-plugin-usage.json` directly | route missing/failing — still shows `总消耗` |
+| `direct` | Qoder `GET /api/v2/quota/usage`; CodeBuddy `POST /billing/meter/get-user-resource` (OAuth only) | route missing/failing — credential files read by us |
 
-所有请求共享 dsh-tap 后端的 60 秒缓存，不会额外增加上游请求。
+Trae has no direct adapter (it needs dsh-tap's device fingerprint headers); that channel is
+simply absent when dsh-tap is gone. `sources[]` in the payload says which adapters answered.
 
-## 显示内容
+Each upstream call carries `AbortSignal.timeout`; the route serves a 30s cache, falls back to
+the last good snapshot (`stale: true`), and never throws into the response.
 
-在左侧菜单底部（会话列表与 Settings 按钮之间）显示一个**占满侧栏全宽**的紧凑 2×2 网格组件：
+## Card layout rules
 
-```
-● CodeBuddy   ● Trae
-  12.3K 剩余    4.1K IDE
-  周期 50.0K    0.0 Work
-  ▓▓▓▓▓▓░░░░   ▓░░░░░░░░░
-● Qoder       ● 消耗
-  0.0 cr...     1.3K c...
-  总量 300.0    316 次请...
-  ░░░░░░░░░░
-─────────────────────────
-22:11 更新            ↻ 刷新
-```
+- grid, 2 columns, **at most 4 cells**;
+- first cell is always `总消耗` (today's share as the bar, totals in the tooltip);
+- then up to three channels that have a number **or an `error`**; a channel with no data and
+  no error is skipped (no empty placeholders);
+- entry order: channel of the model in use (`focus`) → exceeded → lowest remaining ratio →
+  most recently called → fixed order `codebuddy/trae/qoder`;
+- each cell = one text line (`dot label value unit`) + one 2px bar; limits, pools, update time
+  and source live in the cell tooltip;
+- CodeBuddy in api-key mode has no numeric quota upstream: it shows `已用 N credits`, or a bar
+  when `manualQuotaTotal` is configured (remaining = max(0, manual − consumed));
+- the whole card is clickable (force refresh); hidden while the sidebar is collapsed to the rail.
 
-色点含义：
-- 🟢 绿色：余量充足（>30%）
-- 🟡 黄色：余量偏低（10%–30%）
-- 🔴 红色：余量危急（<10%）或获取失败
-- ⚪ 灰色：未登录或无数据
+## Routes
 
-## 实现说明：为什么不用 `sidebar.footer.action` 槽
+- `GET /dsh-tap-quota/snapshot` — `{ ok, at, stale, sources:[{id,ok,ms,error?}], usage:{totalCredit,totalRequests,today,recentModels:[{model,lastTs,calls,credit}]}, channels:[...], focus:{model,channel}|null }`
+  - `?refresh=1` bypasses the 30s cache.
+- `POST /dsh-tap-quota/diag` — client reports (including a composer focus probe) →
+  `~/.dsh/.cache/dsh-tap-quota-client.json` (ring, 60 entries / 64KB). This is how a
+  browser-only symptom ("input cannot be focused") gets diagnosed without DevTools:
+  `focus.top` / `focus.chain` name the element under the composer centre.
 
-该槽是 **list 类型**，宿主把它渲染在一个 `display:flex` 的**行**容器里，而 `dsh-mobile` 插件的「移动访问」按钮注册在**同一行**。两个条目共享一行 flex 空间，余量组件会被压窄到右半侧、内容显示不全——此时无论给组件加多少 `flex:1` / `width:100%` 都无法占满。
+## DOM discipline
 
-因此本插件改为**直接 DOM 注入**：把组件作为块级元素插到侧栏脚部容器（`footArea`，即承载「移动访问」按钮行 + Settings 按钮行的那个 flex column）**之前**，从而独占一行、占满侧栏内容宽度。
+The widget is a sibling block injected before the sidebar's `_footArea` (no slot fits:
+`sidebar.footer.action` is a flex row shared with dsh-mobile's button). Mounting is
+structural and idempotent:
 
-实现细节：
-- 侧栏根元素通过 class 后缀匹配定位（CSS module 的 class 是 hash 的，如 `_2H3hWW_root`），与 dsh-mobile 的做法一致：找含 `_footArea` 与 `_regionArea` 子节点的 `_root` 元素
-- 侧栏折叠为 56px 窄轨时自动隐藏（放不下 2 栏网格）
-- `MutationObserver` 处理侧栏重挂载与折叠/展开切换
-- 插件卸载时（`ctx.effect` 的 disposer）清理 observer、定时器与 DOM 节点
+- one bounded structural query to find the foot area; a `childList`-only observer on its
+  parent; a `ResizeObserver` for the collapsed rail (width threshold, not class names);
+- no class-attribute observation, no whole-document scans, no feedback loop;
+- retry with backoff when the sidebar is not mounted yet; `dispose` removes the card and
+  every observer/timer.
 
-## 开发
+## Config
+
+| key | default | meaning |
+| --- | --- | --- |
+| `requestTimeoutMs` | `6000` | hard deadline per source call |
+| `cacheMs` | `30000` | snapshot cache lifetime (client polls every 60s) |
+| `manualQuotaTotal` | `0` | api-key mode estimate budget (0 = no estimate) |
+| `includeDisabledChannels` | `true` | include channels that report an error (signed out / disabled) |
+| `diagnostics` | `true` | accept client diagnostic reports |
+
+## Dev
 
 ```bash
-# 语法检查
-node --check lib/client.js
-node --check index.js
+node --check index.js && node --check lib/client.js
+node test/run.mjs     # channel normalization, recentModels, buildSnapshot, pickEntries, DOM-discipline asserts
 ```
-
-无构建步骤：纯 DOM API 构建（不依赖 `react-dom`，模块加载器的 require 表未暴露它），与 dsh-tap 的客户端模块同款模块加载器模式。
 
 ## License
 
