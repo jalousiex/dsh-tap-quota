@@ -1,31 +1,30 @@
 /**
- * dsh-tap-quota — host half.
+ * dsh-tap-quota —— 宿主半（host half）。
  *
- * The browser widget renders one compact 2-row card; all data acquisition and
- * normalization happens here, behind a single loopback route. That keeps the
- * browser to ONE request per minute (the old client fired three POSTs straight
- * at another plugin's private route, with no backoff and no way to degrade).
+ * 分工：浏览器端只渲染一张紧凑的两行卡片；**所有数据获取与归一化都在这里**，
+ * 由单条 loopback 路由输出。这样浏览器每分钟只发 **一个** 请求。
+ * （旧实现让客户端直接向另一个插件的私有路由连发三次 POST，没有退避、
+ *  也无法降级——上游一变慢，整个 GUI 都会被拖住。）
  *
- * Sources are probed at runtime, in order, per channel — no hard dependency on
- * any single plugin:
+ * 数据来源在运行时**按顺序探测、逐渠道降级**，不硬依赖任何单一插件：
+ *
  *   tap-route   POST http://127.0.0.1:<webServer.port>/dsh-tap/settings
- *               actions: `usage` (meter + CodeBuddy quota), `trae-quota`,
- *               `qoder-quota`. This is the preferred adapter: it reuses
- *               dsh-tap's upstream dialects and its on-disk usage meter.
- *   tap-files   read ~/.dsh/codebuddy-plugin-usage.json directly (documented
- *               shape). Used when the route is absent/failing so the card can
- *               still show total consumption.
- *   direct      read the credential files ourselves and hit upstream:
- *               Qoder  GET  https://openapi.qoder.com.cn/api/v2/quota/usage
- *               CodeBuddy POST https://copilot.tencent.com/billing/meter/get-user-resource
- *               (OAuth only; api-key mode has no numeric quota upstream).
- *               Trae has no direct adapter — it needs dsh-tap's device
- *               fingerprint headers; the channel is simply absent.
+ *               action 支持 `usage`（用量表 + CodeBuddy 配额）、`trae-quota`、
+ *               `qoder-quota`。**首选**：复用 dsh-tap 的上游方言与落盘用量表。
+ *   tap-files   直接读 ~/.dsh/codebuddy-plugin-usage.json（有文档的固定结构）。
+ *               路由缺失/失败时使用，保证卡片仍能显示累计消耗。
+ *   direct      自行读凭据文件并直连上游：
+ *                 Qoder     GET  https://openapi.qoder.com.cn/api/v2/quota/usage
+ *                 CodeBuddy POST https://copilot.tencent.com/billing/meter/get-user-resource
+ *               （仅 OAuth；api-key 模式上游没有数值配额）
+ *               Trae 没有直连适配器 —— 它需要 dsh-tap 的设备指纹头，
+ *               因此该渠道直接缺席，而不是伪造一个数字。
  *
- * Every upstream call carries AbortSignal.timeout; the route answers from a
- * 30s cache, serves the last good snapshot when a refresh fails, and never
- * throws into the response. Nothing secret is ever returned: only numbers,
- * labels, units and an `error` string.
+ * 硬规则（踩过的坑，别改回去）：
+ *   · 每次上游请求都带 AbortSignal.timeout —— 上游挂住绝不把路由挂住。
+ *   · 路由走 30 秒缓存，刷新失败时发**上一份好数据**（stale:true），
+ *     从不把异常抛进响应。
+ *   · 绝不回传任何机密：只回数字、标签、单位与一条 error 字符串。
  */
 
 import { readFile, mkdir, writeFile } from 'node:fs/promises'
@@ -37,17 +36,17 @@ const SNAPSHOT = '/dsh-tap-quota/snapshot'
 const DIAG = '/dsh-tap-quota/diag'
 const QODER_BASE = 'https://openapi.qoder.com.cn'
 const CODEBUDDY_BASE = 'https://copilot.tencent.com'
-/** A usage entry older than this is not "the model in use". */
+/** 用量条目早于这个时长，就不算「当前在用的模型」。 */
 const FOCUS_WINDOW_MS = 15 * 60 * 1000
 const DIAG_MAX = 60
 const DIAG_MAX_BYTES = 64 * 1024
 
 export const Config = z.object({
-  /** Hard deadline for one source call. */
+  /** 单次数据源调用的硬性超时。 */
   requestTimeoutMs: z.number().step(500).min(1000).default(6000),
-  /** Snapshot cache lifetime; the client polls every 60s. */
+  /** 快照缓存存活时长；客户端每 60 秒轮询一次。 */
   cacheMs: z.number().step(1000).min(0).default(30000),
-  /** Estimate budget for api-key mode (0 = no estimate, show used only). */
+  /** api-key 模式的估算额度（0 = 不估算，只显示已用）。 */
   manualQuotaTotal: z.number().min(0).default(0),
   includeDisabledChannels: z.boolean().default(true),
   diagnostics: z.boolean().default(true),
@@ -80,7 +79,7 @@ const toneOf = (remain, limit) => {
   return 'ok'
 }
 
-/** Group the meter's recent chat rows into per-model recency. */
+/** 把用量表里最近的对话记录按模型归并，得出各模型的新近程度。 */
 export function recentModels(usage, limit = 6) {
   const rows = Array.isArray(usage?.recent) ? usage.recent : []
   const byModel = new Map()
@@ -99,7 +98,7 @@ export function recentModels(usage, limit = 6) {
   return [...byModel.values()].sort((a, b) => b.lastTs - a.lastTs).slice(0, limit)
 }
 
-/** Normalize the CodeBuddy channel: numeric resource, manual estimate, or used-only. */
+/** 归一化 CodeBuddy 渠道：数值资源 / 手工估算 / 仅已用，三选一。 */
 export function codebuddyChannel(quota, usage, manualTotal) {
   const res = quota?.resource
   const error = typeof quota?.error === 'string' && quota.error ? quota.error : null
@@ -126,7 +125,7 @@ export function codebuddyChannel(quota, usage, manualTotal) {
   return { ...base, remain: null, limit: null, used: Number.isFinite(usage?.totalCredit) ? usage.totalCredit : null, exceeded: false, tone: 'off', error }
 }
 
-/** Normalize the Trae channel (IDE pool is the primary one; work stays in pools). */
+/** 归一化 Trae 渠道（IDE 池为主；工作用量留在池里，不单列）。 */
 export function traeChannel(quota) {
   const error = typeof quota?.error === 'string' && quota.error ? quota.error : null
   const ide = quota?.pools?.ide
@@ -139,7 +138,7 @@ export function traeChannel(quota) {
   return { id: 'trae', label: 'Trae', unit: 'credits', signedIn: true, remain, limit, used: round(ide.used), exceeded: remain <= 0, tone: toneOf(remain, limit), error, pools: quota.pools }
 }
 
-/** Normalize the Qoder channel (user quota; add-on stays in the tooltip payload). */
+/** 归一化 Qoder 渠道（用户配额；加购部分留在 tooltip 载荷里，不占主行）。 */
 export function qoderChannel(quota) {
   const error = typeof quota?.error === 'string' && quota.error ? quota.error : null
   const user = quota?.userQuota
@@ -162,7 +161,7 @@ export function qoderChannel(quota) {
   }
 }
 
-/** The channel the most recent chat request belongs to (meter is CodeBuddy-only). */
+/** 最近一次对话请求属于哪个渠道（用量表只覆盖 CodeBuddy）。 */
 export function focusOf(usage, now = Date.now()) {
   const rows = Array.isArray(usage?.recent) ? usage.recent : []
   for (let i = rows.length - 1; i >= 0; i--) {
@@ -259,7 +258,7 @@ export function apply(ctx, config = {}) {
   async function viaDirect() {
     const started = Date.now()
     const out = { via: 'direct', ms: 0, usage: null, codebuddyQuota: null, qoderQuota: null, traeQuota: null }
-    // Qoder: plain bearer on the openapi surface.
+    // Qoder：openapi 面用普通 bearer 鉴权。
     try {
       const auth = await readJson(join(dshHome(), 'qoder-plugin-auth.json'))
       const token = auth?.auth?.accessToken
@@ -274,7 +273,7 @@ export function apply(ctx, config = {}) {
     } catch (error) {
       out.qoderQuota = { error: String(error?.message ?? error) }
     }
-    // CodeBuddy resource: OAuth only (api-key 401s on this route family).
+    // CodeBuddy 资源接口：只认 OAuth（这族路由用 api-key 会 401）。
     try {
       const auth = await readJson(join(dshHome(), 'codebuddy-plugin-auth.json'))
       const token = auth?.auth?.accessToken
@@ -379,14 +378,14 @@ export function apply(ctx, config = {}) {
         const parsed = JSON.parse(await readFile(file, 'utf8'))
         if (Array.isArray(parsed)) list = parsed
       } catch {
-        // first report
+        // 首次上报
       }
       list.push({ receivedAt: Date.now(), ...report })
       if (list.length > DIAG_MAX) list = list.slice(-DIAG_MAX)
       while (list.length > 1 && Buffer.byteLength(JSON.stringify(list)) > DIAG_MAX_BYTES) list.shift()
       await writeFile(file, JSON.stringify(list), 'utf8')
     } catch {
-      // best-effort
+      // 尽力而为
     }
   }
 
@@ -438,7 +437,7 @@ export function apply(ctx, config = {}) {
             const parsed = text ? JSON.parse(text) : null
             if (parsed && typeof parsed === 'object') await appendDiagnostic(parsed)
           } catch {
-            // ignore malformed reports
+            // 忽略格式不正确的上报
           }
         }
         response.writeHead(204, { 'cache-control': 'no-store' })
