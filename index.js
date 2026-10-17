@@ -16,9 +16,42 @@
  *   direct      自行读凭据文件并直连上游：
  *                 Qoder     GET  https://openapi.qoder.com.cn/api/v2/quota/usage
  *                 CodeBuddy POST https://copilot.tencent.com/billing/meter/get-user-resource
+ *                 CodeBuddy POST https://copilot.tencent.com/billing/meter/get-user-request-usage
+ *                            （今日逐条请求流水；见下）
  *               （仅 OAuth；api-key 模式上游没有数值配额）
  *               Trae 没有直连适配器 —— 它需要 dsh-tap 的设备指纹头，
  *               因此该渠道直接缺席，而不是伪造一个数字。
+ *
+ * ## 今日用量（`billing/meter/get-user-request-usage`）
+ *
+ * 这是 2026-10-18 实测到的**未知端点**：路径没有 `/v2` 前缀（与资源包的
+ * `/v2/billing/meter/get-user-resource` 不是一族），但**用同一个 origin 与
+ * 同一个 OAuth bearer 就能通**（copilot.tencent.com 与 www.codebuddy.cn 都 200），
+ * 不需要 dsh-tap 的设备指纹头，所以它是 direct 渠道唯一能补上的缺口。
+ *
+ * 请求体 `{ startTime, endTime, pageNum, pageSize }`，时间格式
+ * `"YYYY-MM-DD HH:mm:ss"`（本地日界）。响应 `data.data[]` 是逐条请求流水：
+ *   { requestId, credit, model, client, requestTime, input, inputTrunc,
+ *     agentPurpose, appType }
+ * `data.total` 是服务端对当页/总量给出的计数。
+ *
+ * 为什么值得单独取：本地 dsh-tap 的用量表（core/usage-meter.js）只记
+ * **经本进程发出的**请求，且只有 SSE 带回 usage 的才算；这个端点是
+ * **服务端口径**，包含别的客户端（IDE 插件、WorkBuddy）在同一账号下的
+ * 请求。两者不一致是正常的，所以快照里**两个都给**，各自标明来源，
+ * 绝不互相覆盖或相加。
+ *
+ * ## DSH 内置余量（账号余额）
+ *
+ * 从宿主服务 `deepseekAccount.getBalance()` 取 —— 就是「设置 → 账号与余额」
+ * 显示的那份数据（充值余额 + 赠金余额）。**不另算、不合并、不估算**：
+ * 内置显示怎么分，这里就怎么分；取不到服务就整行不显示。
+ * `getBalance` 需要一份 ClientMetadata（version/locale/timezone），它只被
+ * 拼成 Platform 的 `x-client-*` 标识头，不参与鉴权；宿主侧用本机时区与
+ * ICU 语言拼出来即可。
+ * 余额一律以**十进制字符串**原样透传（内置 formatBalance 用 Big 做
+ * roundDown），浏览器端按同一套规则格式化 —— 先转 Number 会把 12.34
+ * 变成 12.339999，最后一位就漂了。
  *
  * 硬规则（踩过的坑，别改回去）：
  *   · 每次上游请求都带 AbortSignal.timeout —— 上游挂住绝不把路由挂住。
@@ -28,7 +61,8 @@
  */
 
 import { readFile, mkdir, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { readFileSync } from 'node:fs'
+import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import z from '@deepseek-ai/schemastery'
 
@@ -38,6 +72,19 @@ const QODER_BASE = 'https://openapi.qoder.com.cn'
 const CODEBUDDY_BASE = 'https://copilot.tencent.com'
 /** 用量条目早于这个时长，就不算「当前在用的模型」。 */
 const FOCUS_WINDOW_MS = 15 * 60 * 1000
+/**
+ * 今日流水一页取多少条。**仍是一页，不翻页**（翻页会把快照变成 N 次上游往返，
+ * 同源 HTTP/1.1 只有 6 条连接）；只是把页大小放大到实测可用的上限：
+ * 2026-10-18 实测 pageSize 200/500/1000 都返回完整当天流水（135 条全给），
+ * 100 条才会被截。500 条一天够用，真超了照样老实标 `≥`。
+ */
+const TODAY_PAGE_SIZE = 500
+/** 本地日的起点时间戳（与 core/usage-meter.js 的 dayKey 同口径）。 */
+function startOfDay(ts) {
+  const d = new Date(ts)
+  d.setHours(0, 0, 0, 0)
+  return d.getTime()
+}
 const DIAG_MAX = 60
 const DIAG_MAX_BYTES = 64 * 1024
 
@@ -49,10 +96,60 @@ export const Config = z.object({
   /** api-key 模式的估算额度（0 = 不估算，只显示已用）。 */
   manualQuotaTotal: z.number().min(0).default(0),
   includeDisabledChannels: z.boolean().default(true),
+  /** 是否查询服务端口径的今日用量（get-user-request-usage）。 */
+  todayUsage: z.boolean().default(true),
+  /** 是否查询 DSH 内置账号余额（deepseekAccount.getBalance，与「设置 → 账号与余额」同源）。 */
+  accountBalance: z.boolean().default(true),
   diagnostics: z.boolean().default(true),
 })
 
 export const name = 'dsh-tap-quota'
+
+/** DSH 版本：只填 Platform 的 `x-client-version` 标识头（内置客户端也只把它当标识）。 */
+function resolveClientVersion() {
+  for (const key of ['DSH_CLIENT_VERSION', 'DSH_VERSION']) {
+    const value = process.env[key]
+    if (typeof value === 'string' && value) return value
+  }
+  // Desktop: <app>/resources/app.asar/package.json 的 version 与内置客户端内联的
+  // DSH_CLIENT_VERSION 是同一个值（2026-10 实测 0.2.1-rc.2）。
+  const candidates = []
+  if (typeof process.resourcesPath === 'string' && process.resourcesPath) {
+    candidates.push(join(process.resourcesPath, 'app.asar', 'package.json'))
+  }
+  if (typeof process.execPath === 'string' && process.execPath) {
+    candidates.push(join(dirname(process.execPath), 'resources', 'app.asar', 'package.json'))
+  }
+  for (const candidate of candidates) {
+    try {
+      const pkg = JSON.parse(readFileSync(candidate, 'utf8'))
+      if (typeof pkg?.version === 'string' && pkg.version) return pkg.version
+    } catch {
+      // 非 Electron 宿主（dsh web 直跑）读不到 asar，继续下一个候选
+    }
+  }
+  return '0.0.0'
+}
+
+const CLIENT_VERSION = resolveClientVersion()
+
+/** Platform 只取语言主标签（zh → zh_CN），宿主用 ICU 的默认区域即可。 */
+function hostLocale() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().locale || 'en-US'
+  } catch {
+    return 'en-US'
+  }
+}
+
+/** 与内置 accountClientMetadata 同口径：东八区为 +28800。 */
+function accountClientMetadata() {
+  return {
+    version: CLIENT_VERSION,
+    locale: hostLocale(),
+    timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
+  }
+}
 
 function dshHome() {
   return process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -71,6 +168,58 @@ async function readJson(path) {
 }
 
 const round = (n) => Math.round(n * 100) / 100
+const roundCredit = (n) => Math.round(n * 10000) / 10000
+
+/**
+ * 今日请求流水的请求体时间格式："YYYY-MM-DD HH:mm:ss"（本地日界）。
+ * 上游按这个字面格式解析，用 toISOString 会拿到别的东西。
+ */
+function stampLocal(date) {
+  const p = (n) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())} `
+    + `${p(date.getHours())}:${p(date.getMinutes())}:${p(date.getSeconds())}`
+}
+
+/**
+ * 归一化服务端口径的今日用量（get-user-request-usage 的一页）。
+ *
+ * 只累加本页的行——**不翻页**：该接口按日查询，一天上千页的情况不存在，
+ * 而翻页会把每条快照变成 N 次上游往返（同源 HTTP/1.1 只有 6 条连接）。
+ * 因此 `truncated` 如实标出"取到的行数 >= 服务端报的总量吗"，
+ * 让 UI 能说"≥N 次"而不是假装数字是完整的。
+ */
+export function parseTodayUsage(body) {
+  if (!body || body.code !== 0) return null
+  const data = body.data && typeof body.data === 'object' ? body.data : null
+  if (!data) return null
+  const rows = Array.isArray(data.data) ? data.data : []
+  let credit = 0
+  const byModel = new Map()
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue
+    const c = Number(row.credit)
+    if (Number.isFinite(c)) credit = roundCredit(credit + c)
+    const model = typeof row.model === 'string' && row.model ? row.model : null
+    if (!model) continue
+    const prev = byModel.get(model)
+    if (prev) {
+      prev.requests += 1
+      prev.credit = roundCredit(prev.credit + (Number.isFinite(c) ? c : 0))
+    } else {
+      byModel.set(model, { model, requests: 1, credit: Number.isFinite(c) ? roundCredit(c) : 0 })
+    }
+  }
+  const total = Number.isFinite(Number(data.total)) ? Number(data.total) : null
+  return {
+    requests: rows.length,
+    // 服务端报的总量 > 本页行数 = 被截断了；UI 据此显示"≥"。
+    truncated: total != null && total > rows.length,
+    serverTotal: total,
+    credit: roundCredit(credit),
+    models: [...byModel.values()].sort((a, b) => b.requests - a.requests).slice(0, 5),
+  }
+}
+
 const toneOf = (remain, limit) => {
   if (!Number.isFinite(remain) || !Number.isFinite(limit) || limit <= 0) return 'off'
   const pct = remain / limit
@@ -174,6 +323,27 @@ export function focusOf(usage, now = Date.now()) {
   return null
 }
 
+/**
+ * 归一化内置账号余额（deepseekAccount.getBalance）。
+ *
+ * 与内置「账号与余额」页同一份数据、同一套口径：`value` = 充值余额，
+ * `bonusWallets` = 赠金余额，**分开给、不相加**。金额是十进制字符串，
+ * 原样保留（见文件头说明），只有币种收窄到 CNY/USD。
+ */
+export function normalizeAccount(balance) {
+  if (balance === null || balance === undefined) {
+    return { ok: false, error: 'signed-out', wallets: [], bonusWallets: [] }
+  }
+  if (balance.status !== 'ready') {
+    return { ok: false, error: 'read-failed', wallets: [], bonusWallets: [] }
+  }
+  const pick = (list) =>
+    (Array.isArray(list) ? list : [])
+      .filter((w) => w && typeof w.balance === 'string' && (w.currency === 'CNY' || w.currency === 'USD'))
+      .map((w) => ({ currency: w.currency, balance: w.balance }))
+  return { ok: true, wallets: pick(balance.value), bonusWallets: pick(balance.bonusWallets) }
+}
+
 export function buildSnapshot(parts, config, now = Date.now()) {
   const usage = parts.usage ?? null
   const channels = []
@@ -191,16 +361,25 @@ export function buildSnapshot(parts, config, now = Date.now()) {
     at: now,
     stale: parts.stale === true,
     sources: parts.sources ?? [],
-    usage: usage
+    // 今日用量（服务端口径）独立于本地用量表：dsh-tap 缺席时这一份仍然要能显示，
+    // 所以「有本地用量」或「有今日流水」任一边成立就给出 usage 块。
+    usage: usage || parts.todayUsage
       ? {
-          totalCredit: Number.isFinite(usage.totalCredit) ? usage.totalCredit : 0,
-          totalRequests: Number.isFinite(usage.totalRequests) ? usage.totalRequests : 0,
-          today: usage.today ?? null,
-          recentModels: recentModels(usage),
+          // 本地用量表缺席时留 null（不知道），不要伪造成 0。
+          totalCredit: usage && Number.isFinite(usage.totalCredit) ? usage.totalCredit : null,
+          totalRequests: usage && Number.isFinite(usage.totalRequests) ? usage.totalRequests : null,
+          // 本地口径：dsh-tap 用量表记的（只有经本进程且带回 usage 的请求）。
+          today: usage?.today ?? null,
+          // 服务端口径：get-user-request-usage（含别的客户端）。两者分开给，
+          // 绝不互相覆盖或相加 —— 对不上是正常的，不是 bug。
+          todayUpstream: parts.todayUsage ?? null,
+          recentModels: usage ? recentModels(usage) : [],
         }
       : null,
     channels,
     focus: usage ? focusOf(usage, now) : null,
+    // 内置账号余额：null = 没查/没服务/关掉，客户端整行不渲染。
+    account: parts.account ?? null,
   }
 }
 
@@ -209,6 +388,8 @@ export function apply(ctx, config = {}) {
   const cacheMs = Number.isFinite(config.cacheMs) ? config.cacheMs : 30000
   const manualQuotaTotal = Number.isFinite(config.manualQuotaTotal) ? config.manualQuotaTotal : 0
   const diagnostics = config.diagnostics !== false
+  const useTodayUsage = config.todayUsage !== false
+  const useAccount = config.accountBalance !== false
 
   const state = { cache: { at: 0, value: null }, inFlight: null }
 
@@ -257,7 +438,7 @@ export function apply(ctx, config = {}) {
 
   async function viaDirect() {
     const started = Date.now()
-    const out = { via: 'direct', ms: 0, usage: null, codebuddyQuota: null, qoderQuota: null, traeQuota: null }
+    const out = { via: 'direct', ms: 0, usage: null, codebuddyQuota: null, qoderQuota: null, traeQuota: null, todayUsage: null }
     // Qoder：openapi 面用普通 bearer 鉴权。
     try {
       const auth = await readJson(join(dshHome(), 'qoder-plugin-auth.json'))
@@ -278,24 +459,53 @@ export function apply(ctx, config = {}) {
       const auth = await readJson(join(dshHome(), 'codebuddy-plugin-auth.json'))
       const token = auth?.auth?.accessToken
       if (typeof token === 'string' && token) {
-        const res = await fetch(`${CODEBUDDY_BASE}/billing/meter/get-user-resource`, {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}`, Accept: 'application/json', 'content-type': 'application/json' },
-          body: '{}',
-          signal: AbortSignal.timeout(timeoutMs),
-        })
-        const body = await res.json().catch(() => null)
-        const data = body?.code === 0 ? body?.data?.Response?.Data ?? null : null
-        if (data) {
-          const packs = Array.isArray(data.Accounts) ? data.Accounts : []
-          const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null)
-          const sum = (k) => round(packs.reduce((acc, p) => acc + (num(p[k]) ?? 0), 0))
-          out.codebuddyQuota = {
-            numericQuota: true,
-            resource: { totalRemain: num(data.TotalDosage), cycleRemain: sum('CycleCapacityRemainPrecise'), cycleUsed: sum('CycleCapacityUsedPrecise'), cycleSize: sum('CycleCapacitySizePrecise') },
+        const headers = { Authorization: `Bearer ${token}`, Accept: 'application/json', 'content-type': 'application/json' }
+        // 资源包与今日流水共用一次凭据读取、两个端点（流水是增强，
+        // 失败只留 consologue，资源包照常返回）。
+        const [resRes, usageRes] = await Promise.all([
+          fetch(`${CODEBUDDY_BASE}/billing/meter/get-user-resource`, {
+            method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(timeoutMs),
+          }).catch(() => null),
+          useTodayUsage
+            ? fetch(`${CODEBUDDY_BASE}/billing/meter/get-user-request-usage`, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                  startTime: stampLocal(new Date(startOfDay(Date.now()))),
+                  endTime: stampLocal(new Date()),
+                  pageNum: 1,
+                  pageSize: TODAY_PAGE_SIZE,
+                }),
+                signal: AbortSignal.timeout(timeoutMs),
+              }).catch(() => null)
+            : Promise.resolve(null),
+        ])
+        if (resRes) {
+          const body = await resRes.json().catch(() => null)
+          const data = body?.code === 0 ? body?.data?.Response?.Data ?? null : null
+          if (data) {
+            const packs = Array.isArray(data.Accounts) ? data.Accounts : []
+            const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null)
+            const sum = (k) => round(packs.reduce((acc, p) => acc + (num(p[k]) ?? 0), 0))
+            out.codebuddyQuota = {
+              numericQuota: true,
+              resource: { totalRemain: num(data.TotalDosage), cycleRemain: sum('CycleCapacityRemainPrecise'), cycleUsed: sum('CycleCapacityUsedPrecise'), cycleSize: sum('CycleCapacitySizePrecise') },
+            }
+          } else {
+            out.codebuddyQuota = { error: `codebuddy-http-${resRes.status}`, numericQuota: false }
           }
         } else {
-          out.codebuddyQuota = { error: `codebuddy-http-${res.status}`, numericQuota: false }
+          out.codebuddyQuota = { error: 'codebuddy-network', numericQuota: false }
+        }
+        if (usageRes) {
+          const body = await usageRes.json().catch(() => null)
+          const parsed = parseTodayUsage(body)
+          if (parsed) {
+            out.todayUsage = parsed
+          } else {
+            // 端点在了但没解析出数据：如实记下，UI 不加"≥"以外的东西。
+            out.todayUsage = { requests: 0, credit: 0, models: [], truncated: false, serverTotal: null, error: `usage-http-${usageRes.status}` }
+          }
         }
       }
     } catch (error) {
@@ -303,6 +513,58 @@ export function apply(ctx, config = {}) {
     }
     out.ms = Date.now() - started
     return out
+  }
+
+  /**
+   * 只取今日流水（与 viaDirect 内部同一套逻辑，但独立成一支，
+   * 这样 tap-route 胜出时也能拿到它）。上游挂住有超时兜底。
+   */
+  async function fetchTodayUsage() {
+    const started = Date.now()
+    const auth = await readJson(join(dshHome(), 'codebuddy-plugin-auth.json'))
+    const token = auth?.auth?.accessToken
+    if (typeof token !== 'string' || !token) return null
+    const res = await fetch(`${CODEBUDDY_BASE}/billing/meter/get-user-request-usage`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        startTime: stampLocal(new Date(startOfDay(Date.now()))),
+        endTime: stampLocal(new Date()),
+        pageNum: 1,
+        pageSize: TODAY_PAGE_SIZE,
+      }),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    const body = await res.json().catch(() => null)
+    const parsed = parseTodayUsage(body)
+    if (!parsed) return null
+    return { ...parsed, ms: Date.now() - started }
+  }
+
+  /**
+   * 取 DSH 内置账号余额（与「设置 → 账号与余额」同源）。
+   *
+   * 服务不是硬依赖：`ctx.get('deepseekAccount')` 取不到就返回 null（客户端整行不显示）。
+   * getBalance 内部自带请求超时，这里再兜一层 —— 余额慢绝不拖住整张卡片。
+   */
+  async function fetchAccount() {
+    const service = ctx.get('deepseekAccount')
+    if (!service || typeof service.getBalance !== 'function') return null
+    const started = Date.now()
+    const TIMEOUT = Symbol('account-timeout')
+    let timer = null
+    try {
+      const guard = new Promise((resolve) => {
+        timer = setTimeout(() => resolve(TIMEOUT), timeoutMs)
+      })
+      const balance = await Promise.race([service.getBalance(accountClientMetadata()), guard])
+      if (balance === TIMEOUT) {
+        return { ok: false, error: 'timeout', wallets: [], bonusWallets: [], ms: Date.now() - started }
+      }
+      return { ...normalizeAccount(balance), ms: Date.now() - started }
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
   }
 
   async function collect(port) {
@@ -314,7 +576,55 @@ export function apply(ctx, config = {}) {
     } catch (error) {
       sources.push({ id: 'tap-route', ok: false, error: String(error?.message ?? error) })
     }
-    if (tapped) return buildSnapshot({ ...tapped, sources }, { manualQuotaTotal, includeDisabledChannels: config.includeDisabledChannels !== false })
+    // 今日流水是 direct 渠道独有的能力（dsh-tap 没有这个 action），
+    // 而 tap-route 通常才是赢家 —— 所以**独立取一次**，不管哪条路胜出都补进去。
+    // 内置账号余额与它互不依赖，两者并行；失败只加一条 source 记录，
+    // 绝不影响主快照。
+    const parallel = []
+    if (useTodayUsage) {
+      parallel.push(
+        fetchTodayUsage()
+          .then((value) => ({ id: 'today-usage', ok: value !== null, ms: value?.ms ?? 0, value }))
+          .catch((error) => ({ id: 'today-usage', ok: false, error: String(error?.message ?? error), value: null })),
+      )
+    }
+    if (useAccount) {
+      parallel.push(
+        fetchAccount()
+          .then((value) => ({
+            id: 'account',
+            ok: value !== null && value.ok === true,
+            ms: value?.ms ?? 0,
+            value,
+            // 版本号只进 sources（诊断用），不进 account 结构。
+            meta: { version: CLIENT_VERSION },
+            error: value && !value.ok ? value.error : undefined,
+          }))
+          .catch((error) => ({ id: 'account', ok: false, error: String(error?.message ?? error), value: null })),
+      )
+    }
+    let todayUsage = null
+    let account = null
+    for (const result of await Promise.all(parallel)) {
+      if (result.id === 'account') account = result.value
+      else todayUsage = result.value
+      // 服务不在（account === null 且无错）时不写 source，免得卡片提示里多一条噪声。
+      if (result.error || result.value !== null) {
+        sources.push({
+          id: result.id,
+          ok: result.ok,
+          ms: result.ms,
+          ...(result.meta ?? {}),
+          ...(result.error ? { error: result.error } : {}),
+        })
+      }
+    }
+    if (tapped) {
+      return buildSnapshot(
+        { ...tapped, todayUsage, account, sources },
+        { manualQuotaTotal, includeDisabledChannels: config.includeDisabledChannels !== false },
+      )
+    }
 
     let files = null
     try {
@@ -337,6 +647,9 @@ export function apply(ctx, config = {}) {
         codebuddyQuota: direct?.codebuddyQuota ?? files?.codebuddyQuota ?? null,
         qoderQuota: direct?.qoderQuota ?? null,
         traeQuota: null,
+        // direct 已经取过就别打第二次；只在它没取到时兜底。
+        todayUsage: direct?.todayUsage ?? null,
+        account,
         sources,
       },
       { manualQuotaTotal, includeDisabledChannels: config.includeDisabledChannels !== false },
@@ -366,7 +679,7 @@ export function apply(ctx, config = {}) {
     }
     await startRefresh(port)
     if (state.cache.value !== null) return state.cache.value
-    return { ok: false, at: Date.now(), stale: false, sources: [], usage: null, channels: [], focus: null, error: 'no-source' }
+    return { ok: false, at: Date.now(), stale: false, sources: [], usage: null, channels: [], focus: null, account: null, error: 'no-source' }
   }
 
   async function appendDiagnostic(report) {
@@ -420,7 +733,7 @@ export function apply(ctx, config = {}) {
         try {
           payload = await snapshot(port, force)
         } catch (error) {
-          payload = { ok: false, at: Date.now(), sources: [], usage: null, channels: [], focus: null, error: String(error?.message ?? error) }
+          payload = { ok: false, at: Date.now(), sources: [], usage: null, channels: [], focus: null, account: null, error: String(error?.message ?? error) }
         }
         response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
         response.end(JSON.stringify(payload))
