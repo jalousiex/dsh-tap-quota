@@ -186,7 +186,10 @@ const snap2 = {
 const cells = client.pickEntries(snap2)
 check('at most 4 cells', cells.length, 4)
 check('total first, then exceeded channel', cells.map((c) => c.key), ['total', 'qoder', 'codebuddy', 'trae'])
-check('qoder value', cells[1].value, '0 credits')
+check('qoder value has no unit suffix', cells[1].value, '0')
+check('qoder title keeps the unit', /credits/.test(cells[1].title), true)
+check('total value has no unit suffix', /credits/.test(cells[0].value), false)
+check('total title keeps the unit', /credits/.test(cells[0].title), true)
 check('qoder bar is 0%', cells[1].pct, 0)
 
 const focused = client.pickEntries({ ...snap2, focus: { model: 'hy3', channel: 'codebuddy' } })
