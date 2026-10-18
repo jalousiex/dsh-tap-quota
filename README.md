@@ -1,8 +1,8 @@
 # dsh-tap-quota
 
 Sidebar quota card for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai): a compact
-**2-row** block showing the fixed `总消耗` plus up to three account channels
-(CodeBuddy / TraeWork CN / Qoder CN) — remaining amount, unit and a 2px progress bar — only.
+**2-row** block showing **today's spend and request count** plus up to three account channels
+(CodeBuddy / TraeWork CN / Qoder CN) — remaining amount and unit — only.
 The DSH built-in balance line lives in `dsh-tweaks` (`sidebarBalance`) instead, because it comes
 from a different service; see "Balance moved out" below.
 
@@ -61,7 +61,7 @@ the sidebar where a tinted block just adds visual weight, and a hover fill on a 
 wrapper is a false affordance. The old separator rule above the balance line was dropped for the
 same reason.
 
-## Why there is no "今日消耗" number, and why the 用量 button is gone
+## Why the card shows CodeBuddy's "今日消耗" rather than the official usage page
 
 **设置 → 账号与用量 → 用量明细 is not a readable API, and it cannot be opened from a plugin.**
 The shipped `dsh-client-ui-settings-account` README states that Usage uses the Host-provided
@@ -72,13 +72,16 @@ not a public slot and not a Host service. `deepseekAccount` exposes only `getPro
 `getBalance` plus sign-in methods; there is no "open page" method in the whole service catalogue,
 and the one reachable slot (`account.platform-page`) is that package's **private** occupant —
 registering the same id would **replace** the official entry and break the Settings page.
+The official page's own 消费金额 / 请求次数 / Tokens 只存在于那个网页里，没有公开接口。
 
 So the only non-destructive route was a plain new tab, i.e. "just opening a web page". The `用量`
 button was removed on 2026-10-18 for that reason. `links.usageUrl` is still served so the card
 tooltip can point at 设置 → 账号 → 用量, and a future change can reuse it.
 
-The card therefore **never invents a "今日消耗" figure**: the only number available is CodeBuddy's
-own ledger, which is a different account than the official DeepSeek bill.
+Since 2026-10-18 the first cell shows **today's spend and today's request count** instead of the
+lifetime totals. The numbers are CodeBuddy's own server-side daily ledger (credits → ¥ by
+× 0.072), **not** the official DeepSeek bill: they answer "今天经这个账号花了多少", not
+"官方账单上的消费金额". The card never merges the two, and the tooltip always names the口径.
 
 ### Balance moved out (2026-10-18)
 
@@ -140,17 +143,28 @@ and measures the real wall clock, which is how the 12s regression above was caug
 ## Card layout rules
 
 - grid, 2 columns, **at most 4 cells**;
-- first cell is always `总消耗` (today's share as the bar, totals in the tooltip);
-  its visible value now also carries **today's request count** (e.g. `1.6K ·今日 70`),
-  and the tooltip reports two counts that must never be merged:
+- first cell is always `消耗`, and it shows **today only** — the running lifetime totals are no
+  longer on the card (they stay in the tooltip as reference). Its visible value is
+  **today's spend + today's request count**, e.g. `¥10.92 ·今日 ≥500`:
+  - money = credits × 0.072 (1 credit = US$0.01, so ¥ = credits × 7.2), rounded to cents,
+    the same magnitude as the official `消费金额`. This is a **unit conversion, not a currency
+    conversion into a DSH bill** — the credit still comes from CodeBuddy's own daily ledger;
+  - the amount prefers the **服务端口径** (`todayUpstream.credit`, includes other clients) and
+    falls back to the **本进程口径** (dsh-tap's meter); the tooltip says which one it used and,
+    when both exist, also shows the in-process share;
+  - the request count is the server-side count, marked `≥` when the page was truncated;
+  - the cell draws **no progress bar**: that bar was "today ÷ lifetime", and lifetime is gone.
+  - the tooltip reports the two counts that must never be merged:
   - **服务端口径** (`get-user-request-usage`) — every request under the account, including
     other clients (IDE plugin, WorkBuddy app). Marked `≥` when the page was truncated
     (`serverTotal > rows.length`); one page of **500** is fetched, never paginated
     (measured 2026-10-18: `pageSize` 200/500/1000 all returned the full day; only 100 truncated),
     so a day beyond 500 requests shows `≥500` rather than pretending the number is complete.
-    The tooltip also lists the day's top three models (`今日模型 hy4-preview×135`).
+    The tooltip also lists the day's top three models with their own spend
+    (`今日模型 hy4-preview×135`).
   - **本进程口径** (dsh-tap's usage meter) — only requests this DSH process sent and that
     returned a billing `usage`. The difference between the two is other clients, not a bug.
+  - lifetime `累计 credits` / `累计 N 次请求` appear in the tooltip only.
 - then up to three channels that have a number, an `error`, **or a `used` total**; only a
   channel with all three absent is skipped (no empty placeholders). `used` matters because
   api-key mode has no numeric quota upstream (`get-user-resource` is OAuth-only — measured

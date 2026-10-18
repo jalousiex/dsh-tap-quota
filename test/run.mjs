@@ -365,18 +365,35 @@ check('upstream 带 error 退回 local', client.todayCount({ todayUpstream: { er
 check('都没有 -> null', client.todayCount({}), null)
 check('truncated 透传', client.todayCount({ todayUpstream: { requests: 100, credit: 0, truncated: true } }).truncated, true)
 
-console.log('totalCell 含今日:')
-const tc = client.totalCell({ totalCredit: 100, totalRequests: 50, today: { credit: 5, requests: 10 }, todayUpstream: { requests: 70, credit: 0, truncated: false } })
-ok('可见值带今日请求数', /今日 70/.test(tc.value))
-ok('tip 标服务端口径', /服务端口径/.test(tc.title))
-ok('tip 带今日消耗', /今日消耗/.test(tc.title))
-const tc2 = client.totalCell({ totalCredit: 100, today: { credit: 5, requests: 10 } })
-ok('只有 local 时 tip 标本进程口径', /本进程口径/.test(tc2.title))
-
-const tc3 = client.totalCell({ totalCredit: null, totalRequests: null, today: null, todayUpstream: { requests: 135, credit: 0, truncated: false, models: [{ model: 'hy4-preview', requests: 135, credit: 0 }] } })
-check('累计缺席时可见值为 —，今日仍显示', tc3.value, '—  ·今日 135')
-ok('累计缺席时不伪造 0', !/累计/.test(tc3.title))
-ok('tip 带今日按模型拆分', /今日模型 hy4-preview×135/.test(tc3.title))
+console.log('totalCell（只看今天）:')
+check('money：credits × 7.2 到分', client.money(151.67), '¥10.92')
+check('money：0 显示 ¥0.00', client.money(0), '¥0.00')
+check('money：极小额显示 <¥0.01', client.money(0.01), '<¥0.01')
+check('money：null 显示 —', client.money(null), '—')
+{
+  const tc = client.totalCell({ totalCredit: 1532, totalRequests: 100, today: { credit: 5, requests: 10 }, todayUpstream: { requests: 500, credit: 151.67, truncated: true, models: [] } })
+  check('可见值 = 今日金额 ·今日请求数', tc.value, '¥10.92 ·今日 ≥500')
+  ok('主行不再出现累计', !/累计/.test(tc.value))
+  ok('累计只留在 tip 里', /累计 1\.5K credits/.test(tc.title) && /累计 100 次请求/.test(tc.title))
+  ok('tip 标出金额口径', /今日消耗 ¥10\.92（服务端口径）/.test(tc.title))
+  ok('没有累计可对比就不画比例条', tc.pct === null)
+}
+{
+  const tc2 = client.totalCell({ totalCredit: 100, today: { credit: 5, requests: 10 } })
+  check('只有本进程口径时用本进程金额', tc2.value, '¥0.36 ·今日 10')
+  ok('tip 标本进程口径', /（本进程口径）/.test(tc2.title))
+}
+{
+  const tc3 = client.totalCell({ totalCredit: null, totalRequests: null, today: null, todayUpstream: { requests: 135, credit: 0, truncated: false, models: [{ model: 'hy4-preview', requests: 135, credit: 0 }] } })
+  check('累计缺席时今日照常显示', tc3.value, '¥0.00 ·今日 135')
+  ok('累计缺席时不伪造累计', !/累计/.test(tc3.title))
+  ok('tip 带今日按模型拆分', /今日模型 hy4-preview×135/.test(tc3.title))
+}
+{
+  const tc4 = client.totalCell({ totalCredit: 99, today: null, todayUpstream: null })
+  check('今日数据全缺席时金额显示 —', tc4.value, '—')
+  ok('tip 说明读不到', /今日消耗 —/.test(tc4.title))
+}
 
 console.log('render（最小 DOM 桩，走真实挂载路径）:')
 const domClient = loadClient(join(root, 'lib', 'client.js'), { document: stubDom() })
