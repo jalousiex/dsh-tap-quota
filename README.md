@@ -1,4 +1,8 @@
-# dsh-tap-quota
+# dsh-tap-quota（渠道余量）
+
+> **渠道余量** —— 侧边栏两行卡片：显示 CodeBuddy / TraeWork CN / Qoder CN 的渠道余量，
+> 以及今日消耗（金额 + 请求数）。宿主汇总上游数据，浏览器每轮只发一个请求。
+> 面向国际读者的正文保持英文，命名与描述以中文为准（`locale/zh.json`）。
 
 Sidebar quota card for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai): a compact
 **2-row** block showing **today's spend and request count** plus up to three account channels

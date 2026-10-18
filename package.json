@@ -7,11 +7,13 @@
   "exports": {
     ".": "./index.js",
     "./client": "./lib/client.js",
+    "./locale/*.json": "./locale/*.json",
     "./package.json": "./package.json"
   },
   "files": [
     "index.js",
     "lib/client.js",
+    "locale/*.json",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
