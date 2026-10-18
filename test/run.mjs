@@ -365,10 +365,15 @@ ok('tip 带今日按模型拆分', /今日模型 hy4-preview×135/.test(tc3.titl
 console.log('render（最小 DOM 桩，走真实挂载路径）:')
 const domClient = loadClient(join(root, 'lib', 'client.js'), { document: stubDom() })
 const widget = domClient.buildWidget()
-// 余额行已迁往 dsh-tweaks：本卡片只剩 4 个单元格，不再有 row / rowVal / refreshBtn。
+// 余额行已迁往 dsh-tweaks：本卡片只剩 4 个单元格，不再有 row / rowVal。
 check('卡片是 4 个单元格', widget.cells.length, 4)
 ok('不再有余额行节点', widget.row === undefined && widget.rowVal === undefined)
-ok('不再有刷新按钮节点（刷新走整卡点击）', widget.refreshBtn === undefined)
+// 本卡自己的刷新按钮：右下角悬浮、悬停才亮（与 dsh-tweaks 余额行的常驻 ⟳ 区分）。
+ok('有本卡专属的刷新按钮', !!widget.refreshBtn && widget.refreshBtn.className.indexOf('qw-refresh') === 0)
+ok('刷新按钮默认透明且不可点', /\.qw-refresh\{[^}]*opacity:0/.test(clientSource) && /\.qw-refresh\{[^}]*pointer-events:none/.test(clientSource))
+ok('悬停卡片才显示刷新按钮', /\.qw-wrap:hover \.qw-refresh/.test(clientSource))
+ok('刷新按钮绝对定位在右下角', /\.qw-refresh\{[^}]*position:absolute/.test(clientSource) && /\.qw-refresh\{[^}]*right:2px/.test(clientSource) && /\.qw-refresh\{[^}]*bottom:1px/.test(clientSource))
+ok('刷新时转圈反馈', /\.qw-refresh\.busy>i\{animation:qw-spin/.test(clientSource))
 domClient.render(widget, { channels: [], usage: null })
 ok('渲染不依赖 account 字段', widget.wrap.title.length > 0)
 

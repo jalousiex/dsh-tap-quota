@@ -164,6 +164,18 @@ and measures the real wall clock, which is how the 12s regression above was caug
   when `manualQuotaTotal` is configured (remaining = max(0, manual − consumed));
 - the whole card is clickable (force refresh); hidden while the sidebar is collapsed to the rail.
 
+### The card's own refresh button
+
+A small `⟳` sits in the card's **bottom-right corner**, absolutely positioned so it never takes a
+grid cell, and it is **hidden until the card is hovered** (`.qw-wrap:hover .qw-refresh`; it also
+reveals on `:focus-visible` for keyboard users). Clicking it forces `?refresh=1` and spins the glyph
+while the request is in flight.
+
+It deliberately does **not** look like the always-visible `⟳` on the `dsh-tweaks` balance line:
+that one belongs to the DSH account balance row, this one only re-reads the upstream channel
+quotas. Different owner, different position, different reveal rule — so the two are not confused.
+Its click stops propagation so the card-wide handler does not fire a second request.
+
 ## Routes
 
 - `GET /dsh-tap-quota/snapshot` — `{ ok, at, stale, sources:[{id,ok,ms,version?,error?}], usage:{totalCredit,totalRequests,today,recentModels,todayUpstream:{requests,truncated,serverTotal,credit,models[]}|null}, channels:[...], focus:{model,channel}|null }`
