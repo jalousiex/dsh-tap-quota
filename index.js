@@ -41,22 +41,33 @@
  * 请求。两者不一致是正常的，所以快照里**两个都给**，各自标明来源，
  * 绝不互相覆盖或相加。
  *
- * ## DSH 内置余量（账号余额）
+ * ## 官方用量明细入口（只给链接，不给数字）
  *
- * 从宿主服务 `deepseekAccount.getBalance()` 取 —— 就是「设置 → 账号与余额」
- * 显示的那份数据（充值余额 + 赠金余额）。**不另算、不合并、不估算**：
- * 内置显示怎么分，这里就怎么分；取不到服务就整行不显示。
- * `getBalance` 需要一份 ClientMetadata（version/locale/timezone），它只被
- * 拼成 Platform 的 `x-client-*` 标识头，不参与鉴权；宿主侧用本机时区与
- * ICU 语言拼出来即可。
- * 余额一律以**十进制字符串**原样透传（内置 formatBalance 用 Big 做
- * roundDown），浏览器端按同一套规则格式化 —— 先转 Number 会把 12.34
- * 变成 12.339999，最后一位就漂了。
+ * 「设置 → 账号与用量 → 用量明细」**不是一个可读接口**，而是嵌入的 Platform 网页。
+ * 官方 `dsh-client-ui-settings-account/README.md` 明写：Usage 走 `usageUrl` 打开原生
+ * Platform 页面、靠**浏览器自身登录态**、链接**不带 DSH token**；宿主服务
+ * `deepseekAccount` 也只有 `getProfile` / `getBalance` 两个读接口，没有任何用量明细方法。
+ *
+ * 所以卡片**不在这里伪造一个「今日消耗」数字**：那只能来自 CodeBuddy 账，
+ * 与官方账单不是一回事。
+ *
+ * 「用量」角标已移除（2026-10-18）：官方那个 Platform 页由 ui-settings-account
+ * 经**包内私有**的 `PlatformPages` 请求通道打开，既不是公开 slot 也不是 Host service；
+ * 唯一能碰到的 `account.platform-page` 是那个包的私有 occupant，注册同 id 会
+ * **替换**掉官方入口。所以要么劫持（破坏性，不做），要么只在新标签页开网页
+ * （用户认为「只是弹见面」，已去掉）。
+ *
+ * ## 余额行已迁出（2026-10-18）
+ *
+ * 本包**不再读任何 DSH 账号数据**：原先那一行 DSH 余额（deepseekAccount.getBalance）
+ * 与其同源的 tooltip 已整体迁到 `dsh-tweaks` 的 `sidebarBalance` 开关。
+ * 理由：余额来自 **DSH 内置账号服务**，与本卡片的「上游渠道余量」
+ * （CodeBuddy / Trae / Qoder）**不同源**，混在一张卡里语义混乱、权限边界也不清。
+ * 快照里因此没有 `account` / `links` 字段了；本包只碰上游渠道的额度。
  *
  * 硬规则（踩过的坑，别改回去）：
  *   · 每次上游请求都带 AbortSignal.timeout —— 上游挂住绝不把路由挂住。
- *   · 路由走 30 秒缓存，刷新失败时发**上一份好数据**（stale:true），
- *     从不把异常抛进响应。
+ *   · 缓存过期就**等**刷新（stale 只在刷新失败时为 true），绝不每轮都发旧数据。
  *   · 绝不回传任何机密：只回数字、标签、单位与一条 error 字符串。
  */
 
@@ -98,14 +109,12 @@ export const Config = z.object({
   includeDisabledChannels: z.boolean().default(true),
   /** 是否查询服务端口径的今日用量（get-user-request-usage）。 */
   todayUsage: z.boolean().default(true),
-  /** 是否查询 DSH 内置账号余额（deepseekAccount.getBalance，与「设置 → 账号与余额」同源）。 */
-  accountBalance: z.boolean().default(true),
-  diagnostics: z.boolean().default(true),
+    diagnostics: z.boolean().default(true),
 })
 
 export const name = 'dsh-tap-quota'
 
-/** DSH 版本：只填 Platform 的 `x-client-version` 标识头（内置客户端也只把它当标识）。 */
+/** DSH 版本：既填 Platform 的 `x-client-version` 标识头，也进 sources[] 诊断字段。 */
 function resolveClientVersion() {
   for (const key of ['DSH_CLIENT_VERSION', 'DSH_VERSION']) {
     const value = process.env[key]
@@ -132,24 +141,6 @@ function resolveClientVersion() {
 }
 
 const CLIENT_VERSION = resolveClientVersion()
-
-/** Platform 只取语言主标签（zh → zh_CN），宿主用 ICU 的默认区域即可。 */
-function hostLocale() {
-  try {
-    return Intl.DateTimeFormat().resolvedOptions().locale || 'en-US'
-  } catch {
-    return 'en-US'
-  }
-}
-
-/** 与内置 accountClientMetadata 同口径：东八区为 +28800。 */
-function accountClientMetadata() {
-  return {
-    version: CLIENT_VERSION,
-    locale: hostLocale(),
-    timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
-  }
-}
 
 function dshHome() {
   return process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -247,20 +238,50 @@ export function recentModels(usage, limit = 6) {
   return [...byModel.values()].sort((a, b) => b.lastTs - a.lastTs).slice(0, limit)
 }
 
-/** 归一化 CodeBuddy 渠道：数值资源 / 手工估算 / 仅已用，三选一。 */
+/**
+ * 归一化 CodeBuddy 渠道：数值资源 / 手工估算 / 仅已用，三选一。
+ *
+ * **口径纪律（2026-10-18 实测；结论经两次采样修正）**：
+ * `get-user-resource` 同时给两套账，**两套都是实时下降的**：
+ *
+ *   cycleRemain / cycleUsed / cycleSize   本周期还能用 / 本周期已用 / 本周期配额
+ *   totalRemain (TotalDosage = ΣCapacityRemain)   各包剩余总量
+ *
+ * 同一次账号（13:44）：totalRemain=749、cycleRemain=249.18、cycleUsed=750.82、cycleSize=1000。
+ * 差额来自体验版包：本周期（10-01→10-31）已用尽 500/500，cycleRemain=0，
+ * 但资源包仍有 500 的**总量**未被本周期消耗，故 totalRemain 里还留着这 500。
+ *
+ * 旧实现把 remain 取总量口径、limit/used 取周期口径 —— 两套混用，
+ * remain+used=1499.82 却标 limit=1000，卡片永远满格、剩余读数偏高。
+ *
+ * 因此 **remain / limit / used 必须同口径**：一律走周期口径（回答"我现在还能用多少"）。
+ * 总量口径另存 `totalRemain`，只进 tooltip —— 周期重置后数字会跳变
+ * （体验版 10-31、裂变包 11-17 各重置一次），单看一个数容易困惑。
+ */
 export function codebuddyChannel(quota, usage, manualTotal) {
   const res = quota?.resource
   const error = typeof quota?.error === 'string' && quota.error ? quota.error : null
-  const numeric = quota?.numericQuota === true && res && Number.isFinite(res.totalRemain)
+  const cycleSize = Number.isFinite(res?.cycleSize) && res.cycleSize > 0 ? res.cycleSize : null
+  const cycleUsed = Number.isFinite(res?.cycleUsed) ? res.cycleUsed : null
+  const numeric = quota?.numericQuota === true && res
+    && (Number.isFinite(res.cycleRemain) || (cycleSize != null && cycleUsed != null) || Number.isFinite(res.totalRemain))
   const base = { id: 'codebuddy', label: 'CodeBuddy', unit: 'credits', signedIn: !error }
   if (numeric) {
-    const remain = round(res.totalRemain)
-    const limit = Number.isFinite(res.cycleSize) && res.cycleSize > 0 ? round(res.cycleSize) : null
+    let remain
+    if (Number.isFinite(res.cycleRemain)) remain = res.cycleRemain
+    else if (cycleSize != null && cycleUsed != null) remain = cycleSize - cycleUsed
+    else remain = res.totalRemain
+    const limit = cycleSize != null ? round(cycleSize) : null
     return {
       ...base,
-      remain,
+      remain: round(remain),
       limit,
-      used: Number.isFinite(res.cycleUsed) ? round(res.cycleUsed) : null,
+      used: cycleUsed != null ? round(cycleUsed) : null,
+      // 总量口径（Σ 各包 CapacityRemain）单独带一份，只进 tooltip。
+      // 它和周期口径都是实时下降的（2026-10-18 13:44 实测：TotalDosage 749，
+      // cycleRemain 249.18，同一时刻），差别在于本周期已用尽的包仍会剩下「总量」——
+      // 体验版 10-31 重置、裂变包 11-17 重置，两个数都不等于「永久余额」。
+      totalRemain: Number.isFinite(res.totalRemain) ? round(res.totalRemain) : null,
       exceeded: remain <= 0,
       tone: toneOf(remain, limit ?? 0),
       error,
@@ -323,27 +344,6 @@ export function focusOf(usage, now = Date.now()) {
   return null
 }
 
-/**
- * 归一化内置账号余额（deepseekAccount.getBalance）。
- *
- * 与内置「账号与余额」页同一份数据、同一套口径：`value` = 充值余额，
- * `bonusWallets` = 赠金余额，**分开给、不相加**。金额是十进制字符串，
- * 原样保留（见文件头说明），只有币种收窄到 CNY/USD。
- */
-export function normalizeAccount(balance) {
-  if (balance === null || balance === undefined) {
-    return { ok: false, error: 'signed-out', wallets: [], bonusWallets: [] }
-  }
-  if (balance.status !== 'ready') {
-    return { ok: false, error: 'read-failed', wallets: [], bonusWallets: [] }
-  }
-  const pick = (list) =>
-    (Array.isArray(list) ? list : [])
-      .filter((w) => w && typeof w.balance === 'string' && (w.currency === 'CNY' || w.currency === 'USD'))
-      .map((w) => ({ currency: w.currency, balance: w.balance }))
-  return { ok: true, wallets: pick(balance.value), bonusWallets: pick(balance.bonusWallets) }
-}
-
 export function buildSnapshot(parts, config, now = Date.now()) {
   const usage = parts.usage ?? null
   const channels = []
@@ -378,8 +378,8 @@ export function buildSnapshot(parts, config, now = Date.now()) {
       : null,
     channels,
     focus: usage ? focusOf(usage, now) : null,
-    // 内置账号余额：null = 没查/没服务/关掉，客户端整行不渲染。
-    account: parts.account ?? null,
+    // 余额行已迁往 dsh-tweaks 的 sidebarBalance（余额来自 DSH 内置账号服务，
+    // 与本卡片的「上游渠道余量」不同源，分开由各自插件管）。
   }
 }
 
@@ -389,9 +389,8 @@ export function apply(ctx, config = {}) {
   const manualQuotaTotal = Number.isFinite(config.manualQuotaTotal) ? config.manualQuotaTotal : 0
   const diagnostics = config.diagnostics !== false
   const useTodayUsage = config.todayUsage !== false
-  const useAccount = config.accountBalance !== false
 
-  const state = { cache: { at: 0, value: null }, inFlight: null }
+  const state = { cache: { at: 0, value: null }, inFlight: null, lastRefreshFailed: false }
 
   async function postTap(port, action) {
     const res = await fetch(`http://127.0.0.1:${port}/dsh-tap/settings`, {
@@ -541,45 +540,15 @@ export function apply(ctx, config = {}) {
     return { ...parsed, ms: Date.now() - started }
   }
 
-  /**
-   * 取 DSH 内置账号余额（与「设置 → 账号与余额」同源）。
-   *
-   * 服务不是硬依赖：`ctx.get('deepseekAccount')` 取不到就返回 null（客户端整行不显示）。
-   * getBalance 内部自带请求超时，这里再兜一层 —— 余额慢绝不拖住整张卡片。
-   */
-  async function fetchAccount() {
-    const service = ctx.get('deepseekAccount')
-    if (!service || typeof service.getBalance !== 'function') return null
-    const started = Date.now()
-    const TIMEOUT = Symbol('account-timeout')
-    let timer = null
-    try {
-      const guard = new Promise((resolve) => {
-        timer = setTimeout(() => resolve(TIMEOUT), timeoutMs)
-      })
-      const balance = await Promise.race([service.getBalance(accountClientMetadata()), guard])
-      if (balance === TIMEOUT) {
-        return { ok: false, error: 'timeout', wallets: [], bonusWallets: [], ms: Date.now() - started }
-      }
-      return { ...normalizeAccount(balance), ms: Date.now() - started }
-    } finally {
-      if (timer) clearTimeout(timer)
-    }
-  }
-
   async function collect(port) {
     const sources = []
     let tapped = null
-    try {
-      tapped = await viaTapRoute(port)
-      sources.push({ id: 'tap-route', ok: true, ms: tapped.ms })
-    } catch (error) {
-      sources.push({ id: 'tap-route', ok: false, error: String(error?.message ?? error) })
-    }
     // 今日流水是 direct 渠道独有的能力（dsh-tap 没有这个 action），
-    // 而 tap-route 通常才是赢家 —— 所以**独立取一次**，不管哪条路胜出都补进去。
-    // 内置账号余额与它互不依赖，两者并行；失败只加一条 source 记录，
-    // 绝不影响主快照。
+    // 登录态 / 用量明细链接与它互不依赖 —— 三者一起并发发起。
+    //
+    // **并发是纪律要求，不是优化**：原先 parallel 在 `await viaTapRoute()` 之后才发起，
+    // 于是最坏耗时是 6s + 6s = 12s，超过客户端 8s 的 fetch 超时 —— 上游一挂住，
+    // 卡片就会 poll-error 并退避，而不是安静地显示上一份。提前发起后总耗时是三者最大值。
     const parallel = []
     if (useTodayUsage) {
       parallel.push(
@@ -588,26 +557,20 @@ export function apply(ctx, config = {}) {
           .catch((error) => ({ id: 'today-usage', ok: false, error: String(error?.message ?? error), value: null })),
       )
     }
-    if (useAccount) {
-      parallel.push(
-        fetchAccount()
-          .then((value) => ({
-            id: 'account',
-            ok: value !== null && value.ok === true,
-            ms: value?.ms ?? 0,
-            value,
-            // 版本号只进 sources（诊断用），不进 account 结构。
-            meta: { version: CLIENT_VERSION },
-            error: value && !value.ok ? value.error : undefined,
-          }))
-          .catch((error) => ({ id: 'account', ok: false, error: String(error?.message ?? error), value: null })),
-      )
-    }
+    // 先挂上刷新结果：tap-route 成功就并入，否则走 files/direct 降级链。
+    const tappedPromise = viaTapRoute(port)
+      .then((value) => {
+        sources.push({ id: 'tap-route', ok: true, ms: value.ms })
+        return value
+      })
+      .catch((error) => {
+        sources.push({ id: 'tap-route', ok: false, error: String(error?.message ?? error) })
+        return null
+      })
+    tapped = await tappedPromise
     let todayUsage = null
-    let account = null
     for (const result of await Promise.all(parallel)) {
-      if (result.id === 'account') account = result.value
-      else todayUsage = result.value
+      todayUsage = result.value
       // 服务不在（account === null 且无错）时不写 source，免得卡片提示里多一条噪声。
       if (result.error || result.value !== null) {
         sources.push({
@@ -621,7 +584,7 @@ export function apply(ctx, config = {}) {
     }
     if (tapped) {
       return buildSnapshot(
-        { ...tapped, todayUsage, account, sources },
+        { ...tapped, todayUsage, sources },
         { manualQuotaTotal, includeDisabledChannels: config.includeDisabledChannels !== false },
       )
     }
@@ -649,7 +612,6 @@ export function apply(ctx, config = {}) {
         traeQuota: null,
         // direct 已经取过就别打第二次；只在它没取到时兜底。
         todayUsage: direct?.todayUsage ?? null,
-        account,
         sources,
       },
       { manualQuotaTotal, includeDisabledChannels: config.includeDisabledChannels !== false },
@@ -661,6 +623,8 @@ export function apply(ctx, config = {}) {
     state.inFlight = collect(port)
       .catch(() => null)
       .then((value) => {
+        // stale 的唯一来源：本次刷新没产出快照（collect 抛错或全程无源）。
+        state.lastRefreshFailed = value === null
         if (value) state.cache = { at: Date.now(), value }
         return value
       })
@@ -670,16 +634,49 @@ export function apply(ctx, config = {}) {
     return state.inFlight
   }
 
-  async function snapshot(port, force) {
+  /**
+ * 取一份快照。
+ *
+ * **stale 的含义只有一个：本次刷新没成功，正在发上一份**（2026-10-18 修正）。
+ * 旧实现只要缓存过期就 `void startRefresh()` 并把**上一份**标成 stale 发出去 ——
+ * 而 cacheMs(30s) < 客户端轮询(60s)，于是每次轮询都必然走这条路，
+ * 实测 59 次轮询里 57 次 stale，卡片长期挂着误导性的「旧数据」。
+ *
+ * 现在缓存过期就**等**这次刷新；但等待是**有上限的**：客户端 fetch 超时 8s，
+ * 所以硬期限取 5s（留足余量给序列化与传输）。到点还没好就发上一份并标 stale ——
+ * 这正是 stale 该有的含义：数据没拿到，而不是"缓存刚好过期"。
+ * 每个上游自身也带 AbortSignal.timeout(requestTimeoutMs)，两层都不挂路由。
+ */
+async function snapshot(port, force) {
     const fresh = state.cache.value !== null && Date.now() - state.cache.at < cacheMs
     if (fresh && !force) return state.cache.value
-    if (state.cache.value !== null) {
-      void startRefresh(port)
-      return { ...state.cache.value, stale: true }
+    const DEADLINE_MS = 5000
+    let timer = null
+    try {
+      await Promise.race([
+        startRefresh(port),
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, DEADLINE_MS)
+        }),
+      ])
+    } finally {
+      if (timer) clearTimeout(timer)
     }
-    await startRefresh(port)
-    if (state.cache.value !== null) return state.cache.value
-    return { ok: false, at: Date.now(), stale: false, sources: [], usage: null, channels: [], focus: null, account: null, error: 'no-source' }
+    // 刷新成功：state.cache 已被换成新的，直接发（stale 不适用）。
+    if (state.cache.value !== null && !state.lastRefreshFailed) {
+      return state.cache.value
+    }
+    if (state.cache.value !== null) return { ...state.cache.value, stale: true }
+    return {
+      ok: false,
+      at: Date.now(),
+      stale: false,
+      sources: [],
+      usage: null,
+      channels: [],
+      focus: null,
+      error: 'no-source',
+    }
   }
 
   async function appendDiagnostic(report) {
@@ -733,7 +730,7 @@ export function apply(ctx, config = {}) {
         try {
           payload = await snapshot(port, force)
         } catch (error) {
-          payload = { ok: false, at: Date.now(), sources: [], usage: null, channels: [], focus: null, account: null, error: String(error?.message ?? error) }
+          payload = { ok: false, at: Date.now(), sources: [], usage: null, channels: [], focus: null, error: String(error?.message ?? error) }
         }
         response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
         response.end(JSON.stringify(payload))

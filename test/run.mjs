@@ -58,7 +58,7 @@ const hostCtx = {
 vm.createContext(hostCtx)
 vm.runInContext(
   hostSource +
-    '\n;globalThis.__host = { recentModels, codebuddyChannel, traeChannel, qoderChannel, focusOf, buildSnapshot, parseTodayUsage, stampLocal, startOfDay, normalizeAccount };',
+    '\n;globalThis.__host = { recentModels, codebuddyChannel, traeChannel, qoderChannel, focusOf, buildSnapshot, parseTodayUsage, stampLocal, startOfDay };',
   hostCtx,
 )
 const {
@@ -71,7 +71,6 @@ const {
   parseTodayUsage,
   stampLocal,
   startOfDay,
-  normalizeAccount,
 } = hostCtx.__host
 
 const NOW = 1792207310000
@@ -100,7 +99,8 @@ check('latest chat model', focusOf(usage, NOW), { model: 'hy3', channel: 'codebu
 check('stale usage -> no focus', focusOf(usage, NOW + 30 * 60000), null)
 
 console.log('codebuddyChannel:')
-check('numeric resource', codebuddyChannel({ numericQuota: true, resource: { totalRemain: 100, cycleSize: 400, cycleUsed: 300 } }, usage, 0), {
+// 口径锁（2026-10-18 修）：remain/limit/used 必须同口径，都取周期口径 CycleCapacity*。
+check('numeric resource（周期口径）', codebuddyChannel({ numericQuota: true, resource: { totalRemain: 1000, cycleRemain: 100, cycleSize: 400, cycleUsed: 300 } }, usage, 0), {
   id: 'codebuddy',
   label: 'CodeBuddy',
   unit: 'credits',
@@ -108,10 +108,17 @@ check('numeric resource', codebuddyChannel({ numericQuota: true, resource: { tot
   remain: 100,
   limit: 400,
   used: 300,
+  totalRemain: 1000,
   exceeded: false,
   tone: 'warn',
   error: null,
 })
+check('remain+used === limit（同口径自洽）', (() => {
+  const c = codebuddyChannel({ numericQuota: true, resource: { totalRemain: 955, cycleRemain: 455.19, cycleSize: 1000, cycleUsed: 544.81 } }, usage, 0)
+  return Math.round((c.remain + c.used) * 100) / 100 === c.limit
+})(), true)
+check('cycleRemain 缺失按 cycleSize-cycleUsed 反推', codebuddyChannel({ numericQuota: true, resource: { totalRemain: 1000, cycleSize: 400, cycleUsed: 300 } }, usage, 0).remain, 100)
+check('周期口径全缺才回退 TotalDosage', codebuddyChannel({ numericQuota: true, resource: { totalRemain: 100 } }, usage, 0).remain, 100)
 check('manual estimate', codebuddyChannel({ numericQuota: false }, usage, 2000).remain, 431.41)
 check('no numeric/no manual -> used only', codebuddyChannel({ numericQuota: false }, usage, 0).tone, 'off')
 
@@ -221,26 +228,19 @@ check('recentModels 缺席 -> 空数组', snapTodayOnly.usage.recentModels, [])
 check('本地用量表缺席时不产生 focus', snapTodayOnly.focus, null)
 check('两边都没有 -> usage 为 null', buildSnapshot({ usage: null, sources: [] }, {}, NOW).usage, null)
 
-console.log('normalizeAccount / 内置余量:')
-check('未登录 -> signed-out', normalizeAccount(null), { ok: false, error: 'signed-out', wallets: [], bonusWallets: [] })
-check('读取失败 -> read-failed', normalizeAccount({ status: 'failed' }).error, 'read-failed')
-check('可选服务缺失时整个快照 account 为 null', buildSnapshot({ usage, sources: [] }, {}, NOW).account, null)
-check(
-  'ready 归一化：只留 CNY/USD，金额保持字符串',
-  normalizeAccount({
-    status: 'ready',
-    value: [{ currency: 'CNY', balance: '12.30' }, { currency: 'JPY', balance: '9' }],
-    bonusWallets: [{ currency: 'CNY', balance: '5' }],
-  }),
-  { ok: true, wallets: [{ currency: 'CNY', balance: '12.30' }], bonusWallets: [{ currency: 'CNY', balance: '5' }] },
-)
-const snapAccount = buildSnapshot(
-  { usage, account: { ok: true, wallets: [{ currency: 'CNY', balance: '8.5' }], bonusWallets: [] }, sources: [] },
-  {},
-  NOW,
-)
-check('account 透传到快照', snapAccount.account.wallets[0].balance, '8.5')
-check('account 不占 channels', snapAccount.channels.length, 0)
+console.log('余额行已迁出（本包不再碰 DSH 账号数据）:')
+{
+  const snap = buildSnapshot({ usage, sources: [] }, {}, NOW)
+  check('快照没有 account 字段', 'account' in snap, false)
+  check('快照没有 links 字段', 'links' in snap, false)
+  // 死代码护栏：这些符号一旦回来，说明余额又被塞进了本包。
+  // 只查「代码里出现」（排除注释行），因为文件头会解释性地提到这些名字。
+  // 客户端半的对应检查在 loader 之后（clientSource 那时才就绪）。
+  const hostCode = hostSource.split(/\r?\n/).filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l)).join('\n')
+  for (const sym of ['normalizeAccount', 'fetchAccount', 'accountClientMetadata', 'deepseekAccount', 'getBalance']) {
+    ok(`代码里不含 ${sym}`, !new RegExp('\\b' + sym + '\\b').test(hostCode))
+  }
+}
 
 // ── browser half ─────────────────────────────────────────────────────────
 /** 最小 DOM 桩：只实现卡片用到的属性，够跑 buildWidget/render 的真实路径。 */
@@ -362,48 +362,27 @@ check('累计缺席时可见值为 —，今日仍显示', tc3.value, '—  ·�
 ok('累计缺席时不伪造 0', !/累计/.test(tc3.title))
 ok('tip 带今日按模型拆分', /今日模型 hy4-preview×135/.test(tc3.title))
 
-console.log('fmtMoney（与内置 formatBalance 同规则：截断不进位）:')
-check('两位小数', client.fmtMoney('12.34', '¥'), '¥12.34')
-check('补零', client.fmtMoney('5', '¥'), '¥5.00')
-check('第三位起截断', client.fmtMoney('12.3456', '¥'), '¥12.34')
-check('零', client.fmtMoney('0', '¥'), '¥0.00')
-check('不足一分', client.fmtMoney('0.004', '¥'), '<¥0.01')
-check('负的不足一分', client.fmtMoney('-0.004', '¥'), '-¥0.01')
-check('千分位 + 美元', client.fmtMoney('1234.5', '$'), '$1,234.50')
-check('空值', client.fmtMoney(null, '¥'), '¥0.00')
-check('非数字 -> —', client.fmtMoney('abc', '¥'), '—')
-
-console.log('accountRow（内置账号余量那一行）:')
-check('没有 account -> 整行不渲染', client.accountRow(null), null)
-check('只有充值余额', client.accountRow({ ok: true, wallets: [{ currency: 'CNY', balance: '12.34' }], bonusWallets: [] }).value, '¥12.34')
-check('赠金为 0 不显示', /赠/.test(client.accountRow({ ok: true, wallets: [{ currency: 'CNY', balance: '1' }], bonusWallets: [{ currency: 'CNY', balance: '0' }] }).value), false)
-check('赠金非 0 跟在后面', client.accountRow({ ok: true, wallets: [{ currency: 'CNY', balance: '1' }], bonusWallets: [{ currency: 'CNY', balance: '5' }] }).value, '¥1.00 ·赠 ¥5.00')
-check('多币种并列', client.accountRow({ ok: true, wallets: [{ currency: 'CNY', balance: '1' }, { currency: 'USD', balance: '2' }], bonusWallets: [] }).value, '¥1.00 / $2.00')
-check('未登录', client.accountRow({ ok: false, error: 'signed-out', wallets: [], bonusWallets: [] }).value, '未登录')
-check('读取失败 -> —', client.accountRow({ ok: false, error: 'timeout' }).value, '—')
-check('失败 tip 带原因', /timeout/.test(client.accountRow({ ok: false, error: 'timeout' }).title), true)
-check('成功 tip 标同源与充值余额', /账号与余额/.test(client.accountRow({ ok: true, wallets: [], bonusWallets: [] }).title), true)
-
 console.log('render（最小 DOM 桩，走真实挂载路径）:')
 const domClient = loadClient(join(root, 'lib', 'client.js'), { document: stubDom() })
 const widget = domClient.buildWidget()
-check('卡片仍是 4 个单元格 + 1 行', [widget.cells.length, typeof widget.row], [4, 'object'])
-domClient.render(widget, { account: { ok: true, wallets: [{ currency: 'CNY', balance: '12.34' }], bonusWallets: [] }, channels: [], usage: null })
-check('有 account -> 整行显示', widget.row.style.display, 'flex')
-check('行值按内置格式', widget.rowVal.textContent, '¥12.34')
-check('行标签是 DSH', widget.rowName.textContent, 'DSH')
-check('行 tooltip 带同源说明', /账号与余额/.test(widget.row.title), true)
-domClient.render(widget, { account: null, channels: [], usage: null })
-check('无 account -> 整行隐藏', widget.row.style.display, 'none')
-domClient.render(widget, { account: { ok: false, error: 'signed-out', wallets: [], bonusWallets: [] }, channels: [], usage: null })
-check('未登录仍占一行', [widget.row.style.display, widget.rowVal.textContent], ['flex', '未登录'])
-domClient.render(widget, { account: { ok: true, wallets: [{ currency: 'CNY', balance: '1' }], bonusWallets: [{ currency: 'CNY', balance: '5' }] }, channels: [], usage: null })
-check('赠金进同一行', widget.rowVal.textContent, '¥1.00 ·赠 ¥5.00')
+// 余额行已迁往 dsh-tweaks：本卡片只剩 4 个单元格，不再有 row / rowVal / refreshBtn。
+check('卡片是 4 个单元格', widget.cells.length, 4)
+ok('不再有余额行节点', widget.row === undefined && widget.rowVal === undefined)
+ok('不再有刷新按钮节点（刷新走整卡点击）', widget.refreshBtn === undefined)
+domClient.render(widget, { channels: [], usage: null })
+ok('渲染不依赖 account 字段', widget.wrap.title.length > 0)
 
 console.log('client static discipline:')
 ok('does not observe class', !/attributeFilter:\s*\[\s*["']class["']\s*\]/.test(clientSource))
 ok('mount observes childList only', /observer\.observe\(parent,\s*\{\s*childList:\s*true\s*\}\)/.test(clientSource))
 ok('no whole-document root scan', !/querySelectorAll\(\'\[class\*="_root"\]\'\)/.test(clientSource))
+// 客户端半的死代码护栏：余额渲染符号不该再出现（排除注释行）。
+{
+  const clientCode = clientSource.split(/\r?\n/).filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l)).join('\n')
+  for (const sym of ['fmtMoney', 'accountRow', 'symbolOf', 'positiveMoney', 'groupDigits', 'qw-row', 'qw-btn']) {
+    ok(`客户端代码里不含 ${sym}`, !clientCode.includes(sym))
+  }
+}
 
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exitCode = fail === 0 ? 0 : 1
