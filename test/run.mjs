@@ -267,6 +267,22 @@ function stubDom() {
   return document
 }
 
+/** style 桩：记录自定义属性（角标底色自适配用）。 */
+function styleShim(el) {
+  const vars = {}
+  el.style = {
+    ...(el.style || {}),
+    setProperty(k, v) {
+      vars[k] = v
+    },
+    removeProperty(k) {
+      delete vars[k]
+    },
+  }
+  el.__vars = vars
+  return el
+}
+
 function loadClient(path, extraGlobals) {
   const src = readFileSync(path, 'utf8')
   let def = null
@@ -368,14 +384,53 @@ const widget = domClient.buildWidget()
 // 余额行已迁往 dsh-tweaks：本卡片只剩 4 个单元格，不再有 row / rowVal。
 check('卡片是 4 个单元格', widget.cells.length, 4)
 ok('不再有余额行节点', widget.row === undefined && widget.rowVal === undefined)
-// 本卡自己的刷新按钮：右下角悬浮、悬停才亮（与 dsh-tweaks 余额行的常驻 ⟳ 区分）。
+// 本卡自己的刷新按钮：第一行第二格右上留白，悬停才亮（与 dsh-tweaks 余额行的常驻 ⟳ 区分）。
 ok('有本卡专属的刷新按钮', !!widget.refreshBtn && widget.refreshBtn.className.indexOf('qw-refresh') === 0)
 ok('刷新按钮默认透明且不可点', /\.qw-refresh\{[^}]*opacity:0/.test(clientSource) && /\.qw-refresh\{[^}]*pointer-events:none/.test(clientSource))
 ok('悬停卡片才显示刷新按钮', /\.qw-wrap:hover \.qw-refresh/.test(clientSource))
-ok('刷新按钮绝对定位在右下角', /\.qw-refresh\{[^}]*position:absolute/.test(clientSource) && /\.qw-refresh\{[^}]*right:2px/.test(clientSource) && /\.qw-refresh\{[^}]*bottom:1px/.test(clientSource))
+ok('刷新按钮绝对定位在网格第一行第二格右上', /\.qw-refresh\{[^}]*position:absolute/.test(clientSource) && /\.qw-refresh\{[^}]*top:3px/.test(clientSource) && /\.qw-refresh\{[^}]*right:4px/.test(clientSource))
+// 按钮不占位：卡片既不靠 JS 撑 padding-bottom，也不靠 CSS 留底边——
+// 任何一处留底边都会让网格整体多出一行高度。
+ok('刷新按钮不占行高（无 paddingBottom 撑行）', !/paddingBottom\s*=/.test(clientSource))
+{
+  const wrapRule = (clientSource.match(/\.qw-wrap\{[^}]*\}/) || [''])[0]
+  const pad = (wrapRule.match(/padding:([^;}]*)/) || [])[1] || ''
+  // 只允许上下一致的 3px 内边距；底边不得比顶边大。
+  ok('卡片 padding 上下对称、不为角标留底边', /^3px 4px(\s+3px\s+4px)?$/.test(pad.trim()))
+}
 ok('刷新时转圈反馈', /\.qw-refresh\.busy>i\{animation:qw-spin/.test(clientSource))
+// 两处刷新键统一规格：余额行在 dsh-tweaks，它的规格由那边的测试逐项比对，这里只守本侧锚点。
+ok('角标底色属性名与 dsh-tweaks 共用同一个键', /BG_KEY = "dsh-tap-quota:refresh-bg"/.test(clientSource))
 domClient.render(widget, { channels: [], usage: null })
 ok('渲染不依赖 account 字段', widget.wrap.title.length > 0)
+
+console.log('角标底色自适配:')
+check('parseRgb 支持 rgb 三元组', client.parseRgb('rgb(20, 21, 23)'), { r: 20, g: 21, b: 23, a: 1 })
+check('parseRgb 支持现代空格/斜杠写法', client.parseRgb('rgba(10 20 30 / 0.5)'), { r: 10, g: 20, b: 30, a: 0.5 })
+check('parseRgb 遇到 transparent 返回 null', client.parseRgb('transparent'), null)
+check('半透明卡片底色与父层合成', client.blendBackground('rgba(255, 255, 255, 0.1)', { r: 0, g: 0, b: 0, a: 1 }), 'rgb(26, 26, 26)')
+check('父层也透明时兜底白', client.blendBackground('rgba(0, 0, 0, 0.25)', null), 'rgb(191, 191, 191)')
+{
+  // 不透明背景 → 直接把卡片底色写到角标上；透明 → 清掉自定义属性。
+  const cardEl = styleShim({})
+  const btnEl = styleShim({})
+  const globals = {
+    getComputedStyle: (el) => ({ backgroundColor: el === cardEl ? 'rgb(20, 21, 23)' : 'transparent' }),
+  }
+  const c = loadClient(join(root, 'lib', 'client.js'), { document: stubDom(), ...globals })
+  c.syncButtonBackground({ wrap: cardEl, refreshBtn: btnEl })
+  check('不透明卡片底色写进角标自定义属性', btnEl.__vars['dsh-tap-quota:refresh-bg'], 'rgb(20, 21, 23)')
+  const card2 = { parentElement: null }
+  // CSSOM 对透明色报的是 `rgba(0, 0, 0, 0)`，不是 `transparent`。
+  const btn2 = styleShim({})
+  btn2.__vars['dsh-tap-quota:refresh-bg'] = 'rgb(1, 2, 3)'
+  const c2 = loadClient(join(root, 'lib', 'client.js'), {
+    document: stubDom(),
+    getComputedStyle: () => ({ backgroundColor: 'rgba(0, 0, 0, 0)' }),
+  })
+  c2.syncButtonBackground({ wrap: card2, refreshBtn: btn2 })
+  check('卡片透明时清掉角标底色（跟着卡片一起透）', btn2.__vars['dsh-tap-quota:refresh-bg'], undefined)
+}
 
 console.log('client static discipline:')
 ok('does not observe class', !/attributeFilter:\s*\[\s*["']class["']\s*\]/.test(clientSource))

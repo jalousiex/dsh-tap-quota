@@ -166,15 +166,26 @@ and measures the real wall clock, which is how the 12s regression above was caug
 
 ### The card's own refresh button
 
-A small `⟳` sits in the card's **bottom-right corner**, absolutely positioned so it never takes a
-grid cell, and it is **hidden until the card is hovered** (`.qw-wrap:hover .qw-refresh`; it also
-reveals on `:focus-visible` for keyboard users). Clicking it forces `?refresh=1` and spins the glyph
-while the request is in flight.
+A small `⟳` sits at the **right end of the first grid row** (inside row 2's right-hand cell, where
+that cell's short text leaves blank space). It is absolutely positioned, so it takes no grid cell and
+**costs no line of height**, and it is **hidden until the card is hovered** (`.qw-wrap:hover
+.qw-refresh`; it also reveals on `:focus-visible` for keyboard users). Clicking it forces
+`?refresh=1` and spins the glyph while the request is in flight.
 
-It deliberately does **not** look like the always-visible `⟳` on the `dsh-tweaks` balance line:
-that one belongs to the DSH account balance row, this one only re-reads the upstream channel
-quotas. Different owner, different position, different reveal rule — so the two are not confused.
-Its click stops propagation so the card-wide handler does not fire a second request.
+The card is exactly **two text lines tall**: cells carry no inner gap (the grid `row-gap` does the
+spacing) and the progress bar is an absolutely positioned track inside its cell, not a second row —
+an earlier 2px bar under every cell silently padded the block by several pixels. The `消耗` cell has
+no ratio, so it draws no track at all. Its resting background is copied from the card's live computed
+background (`syncButtonBackground` → the `dsh-tap-quota:refresh-bg` custom property), so the hover
+highlight reads correctly under both dark and light themes instead of being a hard-coded grey wash.
+
+The `⟳` on the `dsh-tweaks` balance line belongs to the DSH account balance row and refreshes only
+that; this one only re-reads the upstream channel quotas. They **look and behave the same** — one
+shared spec (14×11, radius 3, 11px, hidden until hovered, 0.75 → 1 on hover, 0.3 disabled, spin while
+in flight, resting background copied from its host line through the shared
+`dsh-tap-quota:refresh-bg` custom property), and `dsh-tweaks/test/run.mjs` compares both stylesheets
+so the two cannot drift. They stay separate owners on purpose. Its click stops propagation so the
+card-wide handler does not fire a second request.
 
 ## Routes
 
